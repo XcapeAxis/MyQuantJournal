@@ -1,0 +1,11 @@
+# data
+data/
+*.parquet
+*.csv
+*.sqlite
+*.db
+
+# python
+.venv/
+__pycache__/
+*.pyc
