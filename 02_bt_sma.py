@@ -1,4 +1,4 @@
-zimport os
+import os
 import pandas as pd
 import backtrader as bt
 
@@ -13,10 +13,10 @@ class SMA_LongFlat(bt.Strategy):
     def next(self):
         if not self.position:
             if self.data.close[0] > self.sma[0]:
-                self.buy(size=100)  # 先写死 100 股，确保能跑通
+                self.order_target_percent(target=0.95)  # 按资金下单，目标仓位95%
         else:
             if self.data.close[0] < self.sma[0]:
-                self.sell(size=self.position.size)
+                self.order_target_percent(target=0.0)  # 平仓，目标仓位0%
 
 class ChinaStockComm(bt.CommInfoBase):
     """
