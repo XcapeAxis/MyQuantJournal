@@ -1,0 +1,11 @@
+# core
+numpy
+pandas
+matplotlib
+
+# data
+akshare
+
+# dev
+pytest
+ruff
