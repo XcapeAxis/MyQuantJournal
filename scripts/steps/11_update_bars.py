@@ -1,55 +1,62 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import threading
-import time
+"""A-share backtest (SQLite bars, project-scoped outputs): 5-day rebalance, compare TopN=1..5.
+
+- Bars are read from SQLite: data/market.db (table: bars)
+- Project outputs are isolated under:
+    data/projects/<project>/signals/
+    artifacts/projects/<project>/
+
+If rank file is missing, this script can auto-build a simple momentum Top5 rank
+file from your SQLite bars.
+
+Examples:
+  python scripts/steps/30_bt_rebalance.py --project 2026Q1_mom --no-show
+  python scripts/steps/30_bt_rebalance.py --project 2026Q1_mom --save auto --no-show
+  python scripts/steps/30_bt_rebalance.py --project 2026Q1_mom --lookback 20 --rebalance-every 5
+"""
+
 import argparse
 import re
 import sqlite3
+from pathlib import Path
+from typing import Dict, List, Tuple
 
+import backtrader as bt
+import matplotlib.pyplot as plt
 import pandas as pd
-import akshare as ak
-from tqdm import tqdm
 
 
-# =============================================================================
-# Robust repo root discovery
-# =============================================================================
+# ---------------- Root / project helpers ----------------
 
 def find_repo_root(start: Path) -> Path:
     start = start.resolve()
     for p in [start, *start.parents]:
         if (p / ".git").exists() or (p / "pyproject.toml").exists():
             return p
-    # Fallback (should almost never happen)
     return start.parents[2]
 
 
-ROOT = find_repo_root(Path(__file__))
+def validate_project_name(name: str) -> str:
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("--project cannot be empty")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_\-]{0,63}", name):
+        raise ValueError(
+            "Invalid --project name. Use 1-64 chars: letters/digits/underscore/hyphen, starting with letter/digit."
+        )
+    return name
 
-# Meta files (CSV)
-META_DIR = ROOT / "data" / "meta"
-META_DIR.mkdir(parents=True, exist_ok=True)
-SYMBOLS_CSV = META_DIR / "symbols.csv"
-REGISTRY_CSV = META_DIR / "registry.csv"
 
-# SQLite bars database (single file, shared across projects)
-DB_PATH = ROOT / "data" / "market.db"
-
-
-def normalize_code(x: str) -> str | None:
-    """Extract 6-digit A-share code from any string."""
-    s = str(x)
-    m = re.search(r"(\d{6})", s)
-    return m.group(1) if m else None
+def project_paths(root: Path, project: str) -> tuple[Path, Path]:
+    """Return (signals_dir, artifacts_dir) for a project."""
+    signals_dir = root / "data" / "projects" / project / "signals"
+    artifacts_dir = root / "artifacts" / "projects" / project
+    return signals_dir, artifacts_dir
 
 
 def is_mainboard(code: str) -> bool:
-    """CN mainboard: starts with 0/6, excluding STAR 688/689."""
-    if not code or len(code) != 6:
-        return False
+    code = str(code).zfill(6)
     if code[0] not in ("0", "6"):
         return False
     if code.startswith(("688", "689")):
@@ -57,490 +64,492 @@ def is_mainboard(code: str) -> bool:
     return True
 
 
-class RateLimiter:
-    """Global limiter shared by all threads."""
-
-    def __init__(self, min_interval: float = 0.25):
-        self.min_interval = float(min_interval)
-        self._lock = threading.Lock()
-        self._last = 0.0
-
-    def wait(self):
-        with self._lock:
-            now = time.time()
-            dt = now - self._last
-            if dt < self.min_interval:
-                time.sleep(self.min_interval - dt)
-            self._last = time.time()
+# ---------------- SQLite bars access ----------------
 
 
-@dataclass
-class UpdateResult:
-    code: str
-    updated: bool
-    last_date: str | None
-    error: str | None
-    empty: bool = False
-    rows: int = 0
-    df: pd.DataFrame | None = None
-
-
-# =============================================================================
-# SQLite helpers
-# =============================================================================
-
-def _get_conn() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    # Pragmas for ingestion performance & fewer lock issues
+def get_conn(db_path: Path) -> sqlite3.Connection:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute("PRAGMA temp_store=MEMORY;")
     conn.execute("PRAGMA busy_timeout=5000;")
     return conn
 
 
-def init_db() -> None:
-    with _get_conn() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS bars (
-                symbol TEXT NOT NULL,
-                freq TEXT NOT NULL,
-                datetime TEXT NOT NULL,
-                open REAL,
-                high REAL,
-                low REAL,
-                close REAL,
-                volume REAL,
-                adj_factor REAL,
-                PRIMARY KEY (symbol, freq, datetime)
-            )
-            """
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_bars_symbol_freq_dt ON bars(symbol, freq, datetime);"
-        )
-        conn.commit()
+def list_db_codes(db_path: Path, freq: str) -> List[str]:
+    sql = "SELECT DISTINCT symbol FROM bars WHERE freq=?"
+    with get_conn(db_path) as conn:
+        rows = conn.execute(sql, (freq,)).fetchall()
+
+    codes = []
+    for (sym,) in rows:
+        sym = str(sym).zfill(6)
+        if sym.isdigit() and len(sym) == 6 and is_mainboard(sym):
+            codes.append(sym)
+    return sorted(set(codes))
 
 
-def infer_last_date_from_db(code: str, freq: str) -> pd.Timestamp | None:
-    init_db()
-    with _get_conn() as conn:
-        row = conn.execute(
-            "SELECT MAX(datetime) FROM bars WHERE symbol=? AND freq=?",
-            (code, freq),
-        ).fetchone()
-    if not row or not row[0]:
-        return None
-    try:
-        return pd.to_datetime(row[0])
-    except Exception:
-        return None
+def load_code_df(
+    db_path: Path,
+    freq: str,
+    code: str,
+    start: pd.Timestamp | None = None,
+    end: pd.Timestamp | None = None,
+    columns: List[str] | None = None,
+) -> pd.DataFrame:
+    """Load one symbol's bars from SQLite into a Backtrader-ready df (datetime index).
 
+    Returned df index: pd.DatetimeIndex ("date")
+    Default columns: [open, high, low, close, volume, openinterest]
 
-def upsert_bars_to_db(code: str, freq: str, df: pd.DataFrame) -> int:
-    """Upsert bars into SQLite using ON CONFLICT."""
+    Special: if columns == ["date", "close"], returns df[["close"]] with date index.
+    """
+    code = str(code).zfill(6)
+
+    want_close_only = columns is not None and columns == ["date", "close"]
+    select_cols = "datetime, close" if want_close_only else "datetime, open, high, low, close, volume"
+
+    sql = f"""
+    SELECT {select_cols}
+    FROM bars
+    WHERE symbol=? AND freq=?
+    """
+    params: list = [code, freq]
+
+    if start is not None:
+        sql += " AND datetime >= ?"
+        params.append(pd.to_datetime(start).strftime("%Y-%m-%d"))
+    if end is not None:
+        sql += " AND datetime <= ?"
+        params.append(pd.to_datetime(end).strftime("%Y-%m-%d"))
+
+    sql += " ORDER BY datetime"
+
+    with get_conn(db_path) as conn:
+        df = pd.read_sql(sql, conn, params=params)
+
     if df is None or df.empty:
-        return 0
+        return pd.DataFrame()
 
-    init_db()
+    df = df.rename(columns={"datetime": "date"})
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.drop_duplicates(["date"]).sort_values("date")
+    df = df.set_index("date")
 
-    d = df.copy()
-    if "date" not in d.columns:
-        raise RuntimeError(f"bars df missing 'date' column: {d.columns.tolist()}")
+    if want_close_only:
+        if "close" not in df.columns:
+            return pd.DataFrame()
+        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+        df = df.dropna(subset=["close"])
+        return df[["close"]]
 
-    d["datetime"] = pd.to_datetime(d["date"]).dt.strftime("%Y-%m-%d")
+    for c in ["open", "high", "low", "close"]:
+        if c not in df.columns:
+            return pd.DataFrame()
+
+    if "volume" not in df.columns:
+        df["volume"] = 0
+
     for c in ["open", "high", "low", "close", "volume"]:
-        if c in d.columns:
-            d[c] = pd.to_numeric(d[c], errors="coerce")
+        df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    if "adj_factor" not in d.columns:
-        # For qfq-adjusted OHLC, adj_factor is not strictly required.
-        d["adj_factor"] = 1.0
+    df["openinterest"] = 0
+    df["openinterest"] = pd.to_numeric(df["openinterest"], errors="coerce")
 
-    d = d.dropna(subset=["datetime", "open", "high", "low", "close"]).copy()
-    d = d.drop_duplicates(subset=["datetime"]).sort_values("datetime")
+    df = df.dropna(subset=["open", "high", "low", "close"])
+    return df[["open", "high", "low", "close", "volume", "openinterest"]]
 
-    rows = [
-        (
-            code,
-            freq,
-            r["datetime"],
-            float(r["open"]) if pd.notna(r["open"]) else None,
-            float(r["high"]) if pd.notna(r["high"]) else None,
-            float(r["low"]) if pd.notna(r["low"]) else None,
-            float(r["close"]) if pd.notna(r["close"]) else None,
-            float(r["volume"]) if pd.notna(r["volume"]) else None,
-            float(r["adj_factor"]) if pd.notna(r["adj_factor"]) else 1.0,
-        )
-        for _, r in d.iterrows()
+
+# ---------------- Rank file locating ----------------
+
+
+def locate_rank_file(explicit: Path, root: Path, project_rank: Path) -> Path | None:
+    # 1) explicit path (if user provided)
+    if explicit.exists():
+        return explicit
+
+    # 2) project-scoped default
+    if project_rank.exists():
+        return project_rank
+
+    # 3) legacy default
+    legacy = root / "data" / "signals" / "rank_top5.parquet"
+    if legacy.exists():
+        return legacy
+
+    # 4) common mis-locations
+    common = [
+        Path.cwd() / "data" / "signals" / "rank_top5.parquet",
+        Path.cwd() / "signals" / "rank_top5.parquet",
+        root / "scripts" / "data" / "signals" / "rank_top5.parquet",
     ]
+    for p in common:
+        if p.exists():
+            return p
+
+    # 5) targeted search (few roots)
+    search_roots = []
+    for r in [root, root / "scripts", Path.cwd(), Path.cwd() / "scripts"]:
+        if r.exists() and r.is_dir():
+            search_roots.append(r)
+
+    cands: List[Path] = []
+    for r in dict.fromkeys(search_roots):
+        try:
+            cands.extend(list(r.rglob("rank_top5.parquet")))
+        except Exception:
+            continue
+
+    if not cands:
+        return None
+
+    cands.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return cands[0]
+
+
+# ---------------- Rank auto-builder (momentum Top5 from SQLite) ----------------
+
+
+def pick_reference_calendar(db_path: Path, freq: str, codes: List[str], min_len: int = 260) -> pd.DatetimeIndex:
+    best_idx: pd.DatetimeIndex | None = None
+    best_len = -1
+
+    for c in codes[:200]:
+        s = load_code_df(db_path, freq, c, columns=["date", "close"])
+        if s.empty:
+            continue
+        n = len(s)
+        if n > best_len:
+            best_len = n
+            best_idx = pd.DatetimeIndex(s.index)
+        if best_len >= min_len:
+            break
+
+    if best_idx is None or best_len < 50:
+        raise RuntimeError("No code has enough bars in SQLite to build a trading calendar.")
+
+    return best_idx.sort_values()
+
+
+def build_rank_top5_from_db(
+    db_path: Path,
+    freq: str,
+    out_path: Path,
+    lookback: int = 20,
+    rebalance_every: int = 5,
+    topk: int = 5,
+    min_bars: int = 160,
+    max_codes_scan: int = 4000,
+) -> Path:
+    codes = list_db_codes(db_path, freq)
+    if not codes:
+        raise FileNotFoundError(f"No bars found in SQLite: {db_path} (freq={freq})")
+
+    codes = codes[:max_codes_scan]
+
+    cal = pick_reference_calendar(db_path, freq, codes)
+    if len(cal) <= lookback + 5:
+        raise RuntimeError("Trading calendar too short.")
+
+    reb_dates = cal[lookback::rebalance_every]
+
+    rows: List[pd.DataFrame] = []
+    for code in codes:
+        s = load_code_df(db_path, freq, code, columns=["date", "close"])
+        if s.empty or len(s) < min_bars:
+            continue
+
+        close = s["close"].astype(float)
+        mom = close.pct_change(lookback)
+        mom_reb = mom.reindex(reb_dates).dropna()
+        if mom_reb.empty:
+            continue
+
+        df = mom_reb.reset_index()
+        df.columns = ["date", "score"]
+        df["code"] = code
+        rows.append(df)
 
     if not rows:
-        return 0
+        raise RuntimeError("No momentum scores built. Check SQLite bars coverage.")
 
-    sql = """
-    INSERT INTO bars(symbol, freq, datetime, open, high, low, close, volume, adj_factor)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(symbol, freq, datetime) DO UPDATE SET
-        open=excluded.open,
-        high=excluded.high,
-        low=excluded.low,
-        close=excluded.close,
-        volume=excluded.volume,
-        adj_factor=excluded.adj_factor
-    """
+    scores = pd.concat(rows, ignore_index=True)
+    scores = scores.sort_values(["date", "score"], ascending=[True, False])
+    scores["rank"] = scores.groupby("date")["score"].rank(method="first", ascending=False)
+    scores = scores[scores["rank"] <= topk].copy()
+    scores["rank"] = scores["rank"].astype(int)
+    scores["code"] = scores["code"].astype(str).str.zfill(6)
 
-    with _get_conn() as conn:
-        cur = conn.cursor()
-        cur.executemany(sql, rows)
-        conn.commit()
-
-    return len(rows)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    scores.to_parquet(out_path, index=False)
+    return out_path
 
 
-# =============================================================================
-# Symbols & registry
-# =============================================================================
-
-def _extract_code_column(df: pd.DataFrame) -> pd.Series:
-    # Common possibilities
-    for col in ["code", "代码", "证券代码", "股票代码"]:
-        if col in df.columns:
-            return df[col]
-    # Fallback: first column
-    return df.iloc[:, 0]
+# ---------------- Backtrader components ----------------
 
 
-def init_symbols_csv(force: bool = False) -> None:
-    """Create symbols.csv using AKShare if missing (or if force=True)."""
-    if SYMBOLS_CSV.exists() and not force:
-        return
+class ChinaStockComm(bt.CommInfoBase):
+    """Simplified A-share costs: commission on both sides + stamp duty on sells."""
 
-    # ak.stock_info_a_code_name() usually returns columns like: code, name
-    df = ak.stock_info_a_code_name()
-    if df is None or df.empty:
-        raise RuntimeError("AKShare returned empty symbols list (stock_info_a_code_name).")
-
-    codes = (
-        _extract_code_column(df)
-        .astype(str)
-        .map(normalize_code)
-        .dropna()
-        .astype(str)
-        .str.zfill(6)
+    params = (
+        ("commission", 0.0003),
+        ("stamp_duty", 0.001),
+        ("stocklike", True),
+        ("commtype", bt.CommInfoBase.COMM_PERC),
     )
 
-    df_out = pd.DataFrame({"code": codes})
-    df_out = df_out[df_out["code"].map(is_mainboard)].drop_duplicates(subset=["code"]).reset_index(drop=True)
-
-    if df_out.empty:
-        raise RuntimeError("Failed to build mainboard symbols list from AKShare output.")
-
-    df_out.to_csv(SYMBOLS_CSV, index=False, encoding="utf-8-sig")
-
-
-def load_symbols(limit: int | None = None, auto_init: bool = True) -> list[str]:
-    if not SYMBOLS_CSV.exists():
-        if auto_init:
-            init_symbols_csv(force=False)
-        else:
-            raise FileNotFoundError(
-                f"Missing {SYMBOLS_CSV}. Please generate it first (or run with --init-symbols)."
-            )
-
-    df = pd.read_csv(SYMBOLS_CSV)
-    if "code" not in df.columns:
-        raise RuntimeError(f"symbols.csv missing 'code' column: {df.columns.tolist()}")
-
-    codes = (
-        df["code"].astype(str)
-        .map(normalize_code)
-        .dropna()
-        .astype(str)
-        .str.zfill(6)
-        .tolist()
-    )
-
-    codes = [c for c in codes if is_mainboard(c)]
-
-    seen = set()
-    uniq: list[str] = []
-    for c in codes:
-        if c not in seen:
-            uniq.append(c)
-            seen.add(c)
-
-    if limit and limit > 0:
-        uniq = uniq[:limit]
-
-    if not uniq:
-        raise RuntimeError(
-            "No valid symbols loaded.\n"
-            f"- Check {SYMBOLS_CSV} content.\n"
-            "- If codes contain prefixes like 'sh600519', this script extracts 6 digits; "
-            "if still empty, your symbols file may be blank or not A-shares."
-        )
-
-    return uniq
+    def _getcommission(self, size, price, pseudoexec):
+        value = abs(size) * price
+        comm = value * self.p.commission
+        if size < 0:  # sell
+            comm += value * self.p.stamp_duty
+        return comm
 
 
-def load_registry(codes: list[str]) -> pd.DataFrame:
-    if REGISTRY_CSV.exists():
-        reg = pd.read_csv(REGISTRY_CSV, dtype={"code": str})
-        reg["code"] = reg["code"].astype(str).str.zfill(6)
-    else:
-        reg = pd.DataFrame({"code": codes, "last_date": [""] * len(codes)})
+class RebalanceTopN(bt.Strategy):
+    params = dict(topn=5, rank_df=None)
 
-    reg = reg.set_index("code").reindex(codes).reset_index()
-    reg["last_date"] = reg["last_date"].fillna("")
-    return reg
+    def __init__(self):
+        sig: pd.DataFrame = self.p.rank_df  # type: ignore
 
+        self._by_date: Dict[pd.Timestamp, List[Tuple[str, int]]] = {}
+        for d, g in sig.groupby("date"):
+            g = g.sort_values(["rank", "code"])
+            self._by_date[pd.Timestamp(d)] = list(zip(g["code"].tolist(), g["rank"].astype(int).tolist()))
 
-def save_registry(reg: pd.DataFrame) -> None:
-    reg.to_csv(REGISTRY_CSV, index=False, encoding="utf-8-sig")
+        self._tradable = {d._name for d in self.datas[1:]}  # skip calendar (data0)
 
+    def next(self):
+        dt = pd.Timestamp(self.datas[0].datetime.date(0))
+        if dt not in self._by_date:
+            return
 
-# =============================================================================
-# AKShare fetch
-# =============================================================================
+        items = self._by_date[dt]
+        chosen = [c for c, r in items if r <= int(self.p.topn) and c in self._tradable]
 
-def fetch_hist_qfq(
-    code: str,
-    start_yyyymmdd: str,
-    end_yyyymmdd: str,
-    limiter: RateLimiter,
-    max_retry: int = 3,
-) -> pd.DataFrame:
-    last_err = ""
-    for attempt in range(max_retry):
-        try:
-            limiter.wait()
-            df = ak.stock_zh_a_hist(
-                symbol=code,
-                period="daily",
-                start_date=start_yyyymmdd,
-                end_date=end_yyyymmdd,
-                adjust="qfq",
-            )
+        if not chosen:
+            for data in self.datas[1:]:
+                self.order_target_percent(data=data, target=0.0)
+            return
 
-            if df is None or df.empty:
-                return pd.DataFrame()
+        w = 1.0 / len(chosen)
+        chosen_set = set(chosen)
 
-            df = df.rename(
-                columns={
-                    "日期": "date",
-                    "开盘": "open",
-                    "最高": "high",
-                    "最低": "low",
-                    "收盘": "close",
-                    "成交量": "volume",
-                    "成交额": "amount",
-                }
-            )
-
-            df["date"] = pd.to_datetime(df["date"])
-            df = df.sort_values("date")
-
-            for c in ["open", "high", "low", "close", "volume"]:
-                if c in df.columns:
-                    df[c] = pd.to_numeric(df[c], errors="coerce")
-
-            df = df.dropna(subset=["date", "open", "high", "low", "close"]).copy()
-            return df[["date", "open", "high", "low", "close", "volume"]]
-
-        except Exception as e:
-            last_err = str(e)
-            time.sleep(0.8 * (attempt + 1))
-
-    raise RuntimeError(
-        f"fetch failed code={code} start={start_yyyymmdd} end={end_yyyymmdd} err={last_err}"
-    )
+        for data in self.datas[1:]:
+            code = data._name
+            self.order_target_percent(data=data, target=(w if code in chosen_set else 0.0))
 
 
-def update_one_fetch(
-    code: str,
-    last_date_str: str,
+def run_one(
+    db_path: Path,
     freq: str,
-    end_yyyymmdd: str,
-    start_if_missing: str,
-    limiter: RateLimiter,
-) -> UpdateResult:
-    """Fetch-only worker. DB write is done in main thread to avoid SQLite locking."""
-    try:
-        inferred_from_registry: pd.Timestamp | None = None
-        if last_date_str and str(last_date_str).strip():
-            try:
-                inferred_from_registry = pd.to_datetime(last_date_str)
-            except Exception:
-                inferred_from_registry = None
+    rank_df: pd.DataFrame,
+    calendar_code: str | None,
+    topn: int,
+    cash: float,
+    commission: float,
+    stamp_duty: float,
+    slippage: float,
+) -> pd.Series:
+    start = rank_df["date"].min()
+    end = rank_df["date"].max()
 
-        inferred_from_db = infer_last_date_from_db(code, freq)
+    codes = sorted(rank_df["code"].astype(str).str.zfill(6).unique().tolist())
 
-        if inferred_from_registry is None:
-            inferred = inferred_from_db
-        elif inferred_from_db is None:
-            inferred = inferred_from_registry
-        else:
-            inferred = max(inferred_from_registry, inferred_from_db)
+    # calendar feed
+    cal_code = str(calendar_code).zfill(6) if calendar_code else None
+    cal_df = pd.DataFrame()
+    if cal_code:
+        cal_df = load_code_df(db_path, freq, cal_code, start=start, end=end)
 
-        if inferred is None:
-            start = start_if_missing
-        else:
-            start = (inferred + pd.Timedelta(days=1)).strftime("%Y%m%d")
+    if cal_df.empty:
+        for c in codes:
+            cal_df = load_code_df(db_path, freq, c, start=start, end=end)
+            if not cal_df.empty:
+                cal_code = c
+                break
 
-        if pd.to_datetime(start) > pd.to_datetime(end_yyyymmdd):
-            return UpdateResult(
-                code=code,
-                updated=False,
-                last_date=(inferred.strftime("%Y-%m-%d") if inferred is not None else None),
-                error=None,
-                empty=True,
-                rows=0,
-                df=None,
-            )
+    if cal_df.empty:
+        raise RuntimeError("Calendar feed not found in SQLite. Ensure bars exist in data/market.db.")
 
-        new_df = fetch_hist_qfq(code, start, end_yyyymmdd, limiter=limiter)
-        if new_df.empty:
-            return UpdateResult(
-                code=code,
-                updated=False,
-                last_date=(inferred.strftime("%Y-%m-%d") if inferred is not None else None),
-                error=None,
-                empty=True,
-                rows=0,
-                df=None,
-            )
+    cerebro = bt.Cerebro(stdstats=False)
+    cerebro.broker.setcash(cash)
+    cerebro.broker.addcommissioninfo(ChinaStockComm(commission=commission, stamp_duty=stamp_duty))
+    cerebro.broker.set_slippage_perc(perc=slippage)
 
-        last_dt = pd.to_datetime(new_df["date"]).max().strftime("%Y-%m-%d")
-        return UpdateResult(
-            code=code,
-            updated=True,
-            last_date=last_dt,
-            error=None,
-            empty=False,
-            rows=len(new_df),
-            df=new_df,
-        )
+    cerebro.adddata(bt.feeds.PandasData(dataname=cal_df), name="__CAL__")
 
-    except Exception as e:
-        return UpdateResult(
-            code=code,
-            updated=False,
-            last_date=(last_date_str or None),
-            error=str(e),
-            empty=False,
-            rows=0,
-            df=None,
-        )
+    loaded = 0
+    for code in codes:
+        df = load_code_df(db_path, freq, code, start=start, end=end)
+        if df.empty:
+            continue
+        cerebro.adddata(bt.feeds.PandasData(dataname=df), name=code)
+        loaded += 1
+
+    if loaded == 0:
+        raise RuntimeError("No tradable feeds loaded from SQLite. Check your rank codes vs DB symbols.")
+
+    cerebro.addanalyzer(bt.analyzers.TimeReturn, _name="ret", timeframe=bt.TimeFrame.Days)
+    cerebro.addstrategy(RebalanceTopN, topn=topn, rank_df=rank_df)
+
+    strat = cerebro.run(maxcpus=1)[0]
+    rets = strat.analyzers.ret.get_analysis()
+
+    s = pd.Series(rets, dtype=float)
+    s.index = pd.to_datetime(s.index)
+    s = s.sort_index().fillna(0.0)
+
+    equity = (1.0 + s).cumprod() * cash
+    equity.name = f"Top{topn}"
+    return equity
+
+
+# ---------------- CLI ----------------
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--limit", type=int, default=0, help="Only update first N symbols for testing. 0=all")
-    ap.add_argument("--workers", type=int, default=6, help="Threads for fetching (suggest 4~8)")
-    ap.add_argument("--min-interval", type=float, default=0.30, help="Global rate limit interval (seconds)")
-    ap.add_argument("--start-if-missing", type=str, default="20160101", help="Start date if missing (YYYYMMDD)")
-    ap.add_argument("--end", type=str, default="", help="End date (YYYYMMDD). Empty=today")
-    ap.add_argument("--freq", type=str, default="1d", help="Frequency label stored in DB (default: 1d)")
+    root = find_repo_root(Path(__file__))
 
-    ap.add_argument("--test-symbol", type=str, default="", help="Test one symbol, e.g. 600519")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--project", type=str, default="2026Q1_mom", help="Project name (e.g., 2026Q1_mom)")
+
+    ap.add_argument("--db", type=str, default=str(root / "data" / "market.db"))
+    ap.add_argument("--freq", type=str, default="1d")
+
+    # rank path: empty means use project default
+    ap.add_argument("--rank", type=str, default="", help="Rank parquet path (empty=use project default)")
+
+    ap.add_argument("--calendar-code", type=str, default="000001")
+    ap.add_argument("--topn-max", type=int, default=5)
+    ap.add_argument("--cash", type=float, default=1_000_000)
+    ap.add_argument("--commission", type=float, default=0.0003)
+    ap.add_argument("--stamp-duty", type=float, default=0.001)
+    ap.add_argument("--slippage", type=float, default=0.0005)
+
+    # save: empty + --no-show => auto save into project artifacts
     ap.add_argument(
-        "--init-symbols",
-        action="store_true",
-        help="Force (re)generate data/meta/symbols.csv via AKShare before updating",
+        "--save",
+        type=str,
+        default="",
+        help="Save plot to path. Use 'auto' to save into project artifacts. Empty saves only when --no-show.",
     )
-    ap.add_argument(
-        "--no-auto-init-symbols",
-        action="store_true",
-        help="If symbols.csv is missing, do NOT auto-generate; raise error instead",
-    )
+
+    # Auto-build rank if missing
+    ap.add_argument("--auto-build-rank", type=int, default=1)
+    ap.add_argument("--lookback", type=int, default=20)
+    ap.add_argument("--rebalance-every", type=int, default=5)
+    ap.add_argument("--topk", type=int, default=5)
+    ap.add_argument("--min-bars", type=int, default=160)
+    ap.add_argument("--max-codes-scan", type=int, default=4000)
+
+    ap.add_argument("--no-show", action="store_true", help="Do not show plot window")
 
     args = ap.parse_args()
 
-    end = args.end.strip() or pd.Timestamp.today().strftime("%Y%m%d")
-    freq = args.freq.strip() or "1d"
+    project = validate_project_name(args.project)
+    signals_dir, artifacts_dir = project_paths(root, project)
+    signals_dir.mkdir(parents=True, exist_ok=True)
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
 
-    init_db()
+    db_path = Path(args.db)
+    freq = (args.freq or "1d").strip()
 
-    print(f"[INFO] ROOT={ROOT}")
-    print(f"[INFO] DB_PATH={DB_PATH}")
-    print(f"[INFO] SYMBOLS_CSV={SYMBOLS_CSV} exists={SYMBOLS_CSV.exists()}")
+    project_rank = signals_dir / "rank_top5.parquet"
+    rank_path = Path(args.rank).resolve() if args.rank.strip() else project_rank
 
-    limiter = RateLimiter(min_interval=args.min_interval)
+    print(f"[INFO] ROOT={root}")
+    print(f"[INFO] PROJECT={project}")
+    print(f"[INFO] DB={db_path} exists={db_path.exists()} freq={freq}")
+    print(f"[INFO] PROJECT_SIGNALS={signals_dir}")
+    print(f"[INFO] PROJECT_ARTIFACTS={artifacts_dir}")
 
-    if args.init_symbols:
-        init_symbols_csv(force=True)
+    rank_found = locate_rank_file(rank_path, root, project_rank)
 
-    if args.test_symbol.strip():
-        code = normalize_code(args.test_symbol)
-        if not code:
-            raise RuntimeError(f"Invalid --test-symbol: {args.test_symbol}")
+    if rank_found is None:
+        if int(args.auto_build_rank) != 1:
+            raise FileNotFoundError(
+                "Missing rank file."
+                f"Tried: {rank_path}"
+                f"Project default: {project_rank}
+"
+                f"Legacy default: {root / 'data' / 'signals' / 'rank_top5.parquet'}
+"
+                "Enable auto build: --auto-build-rank 1
+"
+            )
 
-        df = fetch_hist_qfq(code, args.start_if_missing, end, limiter=limiter)
-        n = upsert_bars_to_db(code, freq, df)
-        last_dt = pd.to_datetime(df["date"]).max().strftime("%Y-%m-%d") if not df.empty else None
-        print(f"[TEST] code={code} rows_fetched={len(df)} rows_upserted={n} last_date={last_dt}")
-        return
+        print(f"[WARN] rank_top5.parquet not found. Auto-building from SQLite -> {project_rank}")
+        rank_found = build_rank_top5_from_db(
+            db_path=db_path,
+            freq=freq,
+            out_path=project_rank,
+            lookback=int(args.lookback),
+            rebalance_every=int(args.rebalance_every),
+            topk=int(args.topk),
+            min_bars=int(args.min_bars),
+            max_codes_scan=int(args.max_codes_scan),
+        )
 
-    codes = load_symbols(limit=args.limit or None, auto_init=(not args.no_auto_init_symbols))
-    print(f"[INFO] loaded symbols={len(codes)} sample={codes[:5]}")
+    # Soft nudge: if using legacy rank, suggest moving it under project
+    if rank_found != project_rank and not project_rank.exists():
+        legacy = root / "data" / "signals" / "rank_top5.parquet"
+        if rank_found == legacy:
+            print("[WARN] Using legacy rank file under data/signals/. Consider moving/copying it into the project signals dir.")
 
-    reg = load_registry(codes)
-    last_map = dict(zip(reg["code"].tolist(), reg["last_date"].astype(str).tolist()))
+    print(f"[INFO] Using rank file: {rank_found}")
 
-    results: list[UpdateResult] = []
+    rank_df = pd.read_parquet(rank_found).copy()
+    rank_df["date"] = pd.to_datetime(rank_df["date"])
+    rank_df["code"] = rank_df["code"].astype(str).str.zfill(6)
+    rank_df["rank"] = rank_df["rank"].astype(int)
 
-    # Fetch in threads; write to DB in main thread on completion to avoid SQLite locking.
-    with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futs = [
-            ex.submit(update_one_fetch, c, last_map.get(c, ""), freq, end, args.start_if_missing, limiter)
-            for c in codes
-        ]
+    curves = []
+    for n in range(1, int(args.topn_max) + 1):
+        print(f"Running Top{n} ...")
+        eq = run_one(
+            db_path=db_path,
+            freq=freq,
+            rank_df=rank_df,
+            calendar_code=(args.calendar_code or "").strip() or None,
+            topn=n,
+            cash=float(args.cash),
+            commission=float(args.commission),
+            stamp_duty=float(args.stamp_duty),
+            slippage=float(args.slippage),
+        )
+        curves.append(eq)
 
-        for fut in tqdm(as_completed(futs), total=len(futs), desc="Fetching"):
-            r = fut.result()
+    df = pd.concat(curves, axis=1).sort_index().dropna(how="all")
+    df_norm = df / df.iloc[0]
 
-            if r.error is None and r.updated and r.df is not None and not r.df.empty:
-                try:
-                    n_upsert = upsert_bars_to_db(r.code, freq, r.df)
-                    r.rows = n_upsert
-                except Exception as e:
-                    r.error = f"DB write failed: {e}"
-                    r.updated = False
+    plt.figure(figsize=(12, 6))
+    for col in df_norm.columns:
+        plt.plot(df_norm.index, df_norm[col].values, label=col)
 
-            r.df = None
-            results.append(r)
+    plt.title(f"{project}: TopN (1..5) {int(args.rebalance_every)}-day rebalance (normalized)")
+    plt.xlabel("Date")
+    plt.ylabel("Equity (normalized)")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
 
-    res_map = {r.code: r for r in results}
+    save_arg = (args.save or "").strip().lower()
+    save_path: Path | None = None
 
-    upd_cnt = sum(1 for r in results if r.updated)
-    err_cnt = sum(1 for r in results if r.error)
-    empty_cnt = sum(1 for r in results if (not r.updated and not r.error and r.empty))
+    if save_arg == "auto" or (save_arg == "" and args.no_show):
+        save_path = artifacts_dir / "topn_1_5.png"
+    elif save_arg:
+        p = Path(args.save)
+        save_path = (root / p).resolve() if not p.is_absolute() else p
 
-    # Write back registry
-    new_last: list[str] = []
-    for _, row in reg.iterrows():
-        c = row["code"]
-        r = res_map.get(c)
-        if r and r.updated and r.last_date:
-            new_last.append(r.last_date)
-        else:
-            new_last.append(str(row["last_date"]))
+    if save_path is not None:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, dpi=200)
+        print(f"Saved plot: {save_path}")
 
-    reg["last_date"] = new_last
-    save_registry(reg)
-
-    print(
-        f"Done. updated={upd_cnt} empty={empty_cnt} errors={err_cnt} "
-        f"registry={REGISTRY_CSV} db={DB_PATH}"
-    )
-
-    if upd_cnt == 0 and err_cnt == 0 and len(codes) > 0:
-        print("[WARN] All requests returned empty data.")
-        print("       - Try: python scripts/steps/11_update_bars.py --test-symbol 600519")
-        print("       - If test also empty, AKShare may be blocked/unstable on your network.")
+    if not args.no_show:
+        plt.show()
 
 
 if __name__ == "__main__":

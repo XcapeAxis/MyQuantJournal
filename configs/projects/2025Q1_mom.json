@@ -1,0 +1,21 @@
+{
+  "freq": "1d",
+  "calendar_code": "000001",
+
+  "lookback": 20,
+  "rebalance_every": 5,
+  "topk": 5,
+
+  "min_bars": 160,
+  "max_codes_scan": 4000,
+
+  "topn_max": 5,
+  "cash": 1000000,
+
+  "commission": 0.0003,
+  "stamp_duty": 0.001,
+  "slippage": 0.0005,
+
+  "auto_build_rank": 1,
+  "save": "auto"
+}

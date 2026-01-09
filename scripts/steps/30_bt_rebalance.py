@@ -1,24 +1,23 @@
 from __future__ import annotations
 
-"""A-share local backtest: 5-day rebalance, compare TopN=1..5 equity curves.
+"""A-share backtest (SQLite bars): 5-day rebalance, compare TopN=1..5 equity curves.
 
-This script is designed to be *self-healing* for common path / missing-file issues:
-- Works whether this file sits in <root>/scripts or directly in <root>.
-- If rank file (data/signals/rank_top5.parquet) is missing, it can auto-build a simple momentum Top5 rank file
-  from your local bars under data/bars_qfq.
+This script uses SQLite bars stored in data/market.db (table: bars) and is designed
+to be robust to working directory / file placement issues.
 
-Expected local bars layout:
-  data/bars_qfq/code=600519/year=2024/part.parquet
+If rank file (data/signals/rank_top5.parquet) is missing, it can auto-build a
+simple momentum Top5 rank file from your SQLite bars.
 
 Run:
-  python 30_bt_rebalance.py
+  python scripts/steps/30_bt_rebalance.py
 
 Optional:
-  python 30_bt_rebalance.py --auto-build-rank 1 --lookback 20 --rebalance-every 5
-  python 30_bt_rebalance.py --save data/signals/topn_1_5.png
+  python scripts/steps/30_bt_rebalance.py --auto-build-rank 1 --lookback 20 --rebalance-every 5
+  python scripts/steps/30_bt_rebalance.py --save artifacts/topn_1_5.png
 """
 
 import argparse
+import sqlite3
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -29,24 +28,12 @@ import pandas as pd
 
 # ---------------- Root / path helpers ----------------
 
-def detect_project_root() -> Path:
-    """Best-effort project root detection (robust to file placement + working directory)."""
-    here = Path(__file__).resolve()
-
-    # Common: <root>/scripts/*.py
-    if here.parent.name.lower() == "scripts":
-        return here.parent.parent
-
-    # Common: <root>/*.py
-    if (here.parent / "scripts").exists() or (here.parent / "data").exists():
-        return here.parent
-
-    # Walk up
-    for p in [here.parent] + list(here.parents):
-        if (p / "scripts").exists() or (p / "data").exists():
+def find_repo_root(start: Path) -> Path:
+    start = start.resolve()
+    for p in [start, *start.parents]:
+        if (p / ".git").exists() or (p / "pyproject.toml").exists():
             return p
-
-    return here.parent
+    return start.parents[2]
 
 
 def is_mainboard(code: str) -> bool:
@@ -58,57 +45,80 @@ def is_mainboard(code: str) -> bool:
     return True
 
 
-def list_local_codes(bars_dir: Path) -> List[str]:
-    if not bars_dir.exists():
-        return []
+# ---------------- SQLite bars access ----------------
+
+
+def get_conn(db_path: Path) -> sqlite3.Connection:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA busy_timeout=5000;")
+    return conn
+
+
+def list_db_codes(db_path: Path, freq: str) -> List[str]:
+    sql = "SELECT DISTINCT symbol FROM bars WHERE freq=?"
+    with get_conn(db_path) as conn:
+        rows = conn.execute(sql, (freq,)).fetchall()
+
     codes = []
-    for p in bars_dir.glob("code=*"):
-        if not p.is_dir():
-            continue
-        code = p.name.split("=")[-1]
-        if len(code) == 6 and code.isdigit() and is_mainboard(code):
-            codes.append(code)
+    for (sym,) in rows:
+        sym = str(sym).zfill(6)
+        if sym.isdigit() and len(sym) == 6 and is_mainboard(sym):
+            codes.append(sym)
     return sorted(set(codes))
 
 
 def load_code_df(
-    bars_dir: Path,
+    db_path: Path,
+    freq: str,
     code: str,
     start: pd.Timestamp | None = None,
     end: pd.Timestamp | None = None,
     columns: List[str] | None = None,
 ) -> pd.DataFrame:
-    """Load one symbol's bars from partitioned parquet into a Backtrader-ready df (datetime index)."""
+    """Load one symbol's bars from SQLite into a Backtrader-ready df (datetime index).
+
+    Returned df index: pd.DatetimeIndex ("date")
+    Default columns: [open, high, low, close, volume, openinterest]
+
+    Special: if columns == ["date", "close"], returns df[["close"]] with date index.
+    """
     code = str(code).zfill(6)
-    code_dir = bars_dir / f"code={code}"
-    parts = sorted(code_dir.rglob("*.parquet"))
-    if not parts:
-        return pd.DataFrame()
 
-    cols = columns or ["date", "open", "high", "low", "close", "volume", "openinterest"]
-    frames = []
-    for p in parts:
-        try:
-            frames.append(pd.read_parquet(p, columns=cols))
-        except Exception:
-            frames.append(pd.read_parquet(p))
+    want_close_only = columns is not None and columns == ["date", "close"]
 
-    df = pd.concat(frames, ignore_index=True)
-    if df.empty or "date" not in df.columns:
-        return pd.DataFrame()
+    select_cols = "datetime, close" if want_close_only else "datetime, open, high, low, close, volume"
 
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.drop_duplicates(["date"]).sort_values("date")
+    sql = f"""
+    SELECT {select_cols}
+    FROM bars
+    WHERE symbol=? AND freq=?
+    """
+    params: list = [code, freq]
 
     if start is not None:
-        df = df[df["date"] >= start]
+        sql += " AND datetime >= ?"
+        params.append(pd.to_datetime(start).strftime("%Y-%m-%d"))
     if end is not None:
-        df = df[df["date"] <= end]
+        sql += " AND datetime <= ?"
+        params.append(pd.to_datetime(end).strftime("%Y-%m-%d"))
 
+    sql += " ORDER BY datetime"
+
+    with get_conn(db_path) as conn:
+        df = pd.read_sql(sql, conn, params=params)
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df = df.rename(columns={"datetime": "date"})
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.drop_duplicates(["date"]).sort_values("date")
     df = df.set_index("date")
 
-    # If only close requested
-    if columns is not None and columns == ["date", "close"]:
+    if want_close_only:
         if "close" not in df.columns:
             return pd.DataFrame()
         df["close"] = pd.to_numeric(df["close"], errors="coerce")
@@ -122,14 +132,18 @@ def load_code_df(
 
     if "volume" not in df.columns:
         df["volume"] = 0
-    if "openinterest" not in df.columns:
-        df["openinterest"] = 0
 
-    for c in ["open", "high", "low", "close", "volume", "openinterest"]:
+    for c in ["open", "high", "low", "close", "volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df["openinterest"] = 0
+    df["openinterest"] = pd.to_numeric(df["openinterest"], errors="coerce")
 
     df = df.dropna(subset=["open", "high", "low", "close"])
     return df[["open", "high", "low", "close", "volume", "openinterest"]]
+
+
+# ---------------- Rank file locating ----------------
 
 
 def locate_rank_file(explicit: Path, root: Path) -> Path | None:
@@ -140,7 +154,6 @@ def locate_rank_file(explicit: Path, root: Path) -> Path | None:
     if expected.exists():
         return expected
 
-    # Common mis-locations (caused by running scripts from a different cwd)
     common = [
         Path.cwd() / "data" / "signals" / "rank_top5.parquet",
         Path.cwd() / "signals" / "rank_top5.parquet",
@@ -150,7 +163,6 @@ def locate_rank_file(explicit: Path, root: Path) -> Path | None:
         if p.exists():
             return p
 
-    # Targeted search only in a few roots
     search_roots = []
     for r in [root, root / "scripts", Path.cwd(), Path.cwd() / "scripts"]:
         if r.exists() and r.is_dir():
@@ -170,43 +182,48 @@ def locate_rank_file(explicit: Path, root: Path) -> Path | None:
     return cands[0]
 
 
-# ---------------- Rank auto-builder (momentum Top5) ----------------
+# ---------------- Rank auto-builder (momentum Top5 from SQLite) ----------------
 
-def pick_reference_calendar(bars_dir: Path, codes: List[str], min_len: int = 260) -> pd.DatetimeIndex:
-    """Pick a code that has a reasonably long history to serve as the rebalance date calendar."""
-    best = None
+
+def pick_reference_calendar(db_path: Path, freq: str, codes: List[str], min_len: int = 260) -> pd.DatetimeIndex:
+    """Pick a code with sufficiently long history to serve as trading calendar."""
+    best_idx: pd.DatetimeIndex | None = None
     best_len = -1
 
-    for c in codes[:200]:  # cap scan
-        df = load_code_df(bars_dir, c, columns=["date", "close"])
-        if df.empty:
+    for c in codes[:200]:
+        s = load_code_df(db_path, freq, c, columns=["date", "close"])
+        if s.empty:
             continue
-        n = len(df)
+        n = len(s)
         if n > best_len:
             best_len = n
-            best = df.index
+            best_idx = pd.DatetimeIndex(s.index)
         if best_len >= min_len:
             break
 
-    if best is None or best_len < 50:
-        raise RuntimeError("No local code has enough bars to build a trading calendar.")
+    if best_idx is None or best_len < 50:
+        raise RuntimeError("No code has enough bars in SQLite to build a trading calendar.")
 
-    return pd.DatetimeIndex(best).sort_values()
+    return best_idx.sort_values()
 
 
-def build_rank_top5_from_local(
-    bars_dir: Path,
+def build_rank_top5_from_db(
+    db_path: Path,
+    freq: str,
     out_path: Path,
     lookback: int = 20,
     rebalance_every: int = 5,
     topk: int = 5,
     min_bars: int = 160,
+    max_codes_scan: int = 4000,
 ) -> Path:
-    codes = list_local_codes(bars_dir)
+    codes = list_db_codes(db_path, freq)
     if not codes:
-        raise FileNotFoundError(f"No local bars found under: {bars_dir}")
+        raise FileNotFoundError(f"No bars found in SQLite: {db_path} (freq={freq})")
 
-    cal = pick_reference_calendar(bars_dir, codes)
+    codes = codes[:max_codes_scan]
+
+    cal = pick_reference_calendar(db_path, freq, codes)
     if len(cal) <= lookback + 5:
         raise RuntimeError("Trading calendar too short.")
 
@@ -214,7 +231,7 @@ def build_rank_top5_from_local(
 
     rows: List[pd.DataFrame] = []
     for code in codes:
-        s = load_code_df(bars_dir, code, columns=["date", "close"])
+        s = load_code_df(db_path, freq, code, columns=["date", "close"])
         if s.empty or len(s) < min_bars:
             continue
 
@@ -230,7 +247,7 @@ def build_rank_top5_from_local(
         rows.append(df)
 
     if not rows:
-        raise RuntimeError("No momentum scores built. Check your local bars coverage.")
+        raise RuntimeError("No momentum scores built. Check SQLite bars coverage.")
 
     scores = pd.concat(rows, ignore_index=True)
     scores = scores.sort_values(["date", "score"], ascending=[True, False])
@@ -245,6 +262,7 @@ def build_rank_top5_from_local(
 
 
 # ---------------- Backtrader components ----------------
+
 
 class ChinaStockComm(bt.CommInfoBase):
     """Simplified A-share costs: commission on both sides + stamp duty on sells."""
@@ -299,7 +317,8 @@ class RebalanceTopN(bt.Strategy):
 
 
 def run_one(
-    bars_dir: Path,
+    db_path: Path,
+    freq: str,
     rank_df: pd.DataFrame,
     calendar_code: str | None,
     topn: int,
@@ -317,18 +336,17 @@ def run_one(
     cal_code = str(calendar_code).zfill(6) if calendar_code else None
     cal_df = pd.DataFrame()
     if cal_code:
-        cal_df = load_code_df(bars_dir, cal_code, start=start, end=end)
+        cal_df = load_code_df(db_path, freq, cal_code, start=start, end=end)
 
     if cal_df.empty:
-        # fallback to a code from rank_df
         for c in codes:
-            cal_df = load_code_df(bars_dir, c, start=start, end=end)
+            cal_df = load_code_df(db_path, freq, c, start=start, end=end)
             if not cal_df.empty:
                 cal_code = c
                 break
 
     if cal_df.empty:
-        raise RuntimeError("Calendar feed not found. Ensure you have local bars under data/bars_qfq.")
+        raise RuntimeError("Calendar feed not found in SQLite. Ensure bars exist in data/market.db.")
 
     cerebro = bt.Cerebro(stdstats=False)
     cerebro.broker.setcash(cash)
@@ -339,14 +357,14 @@ def run_one(
 
     loaded = 0
     for code in codes:
-        df = load_code_df(bars_dir, code, start=start, end=end)
+        df = load_code_df(db_path, freq, code, start=start, end=end)
         if df.empty:
             continue
         cerebro.adddata(bt.feeds.PandasData(dataname=df), name=code)
         loaded += 1
 
     if loaded == 0:
-        raise RuntimeError("No tradable feeds loaded. Check your rank codes vs local bars.")
+        raise RuntimeError("No tradable feeds loaded from SQLite. Check your rank codes vs DB symbols.")
 
     cerebro.addanalyzer(bt.analyzers.TimeReturn, _name="ret", timeframe=bt.TimeFrame.Days)
     cerebro.addstrategy(RebalanceTopN, topn=topn, rank_df=rank_df)
@@ -364,10 +382,12 @@ def run_one(
 
 
 def main():
-    root = detect_project_root()
+    root = find_repo_root(Path(__file__))
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("--bars-dir", type=str, default=str(root / "data" / "bars_qfq"))
+    ap.add_argument("--db", type=str, default=str(root / "data" / "market.db"))
+    ap.add_argument("--freq", type=str, default="1d")
+
     ap.add_argument("--rank", type=str, default=str(root / "data" / "signals" / "rank_top5.parquet"))
     ap.add_argument("--calendar-code", type=str, default="000001")
     ap.add_argument("--topn-max", type=int, default=5)
@@ -383,15 +403,18 @@ def main():
     ap.add_argument("--rebalance-every", type=int, default=5)
     ap.add_argument("--topk", type=int, default=5)
     ap.add_argument("--min-bars", type=int, default=160)
-    ap.add_argument("--no-show", action="store_true", help="不显示图形窗口")
+    ap.add_argument("--max-codes-scan", type=int, default=4000)
+
+    ap.add_argument("--no-show", action="store_true", help="Do not show plot window")
 
     args = ap.parse_args()
 
-    bars_dir = Path(args.bars_dir)
+    db_path = Path(args.db)
+    freq = (args.freq or "1d").strip()
     rank_path = Path(args.rank)
 
     print(f"[INFO] ROOT={root}")
-    print(f"[INFO] BARS_DIR={bars_dir} exists={bars_dir.exists()}")
+    print(f"[INFO] DB={db_path} exists={db_path.exists()} freq={freq}")
 
     rank_found = locate_rank_file(rank_path, root)
 
@@ -406,14 +429,16 @@ def main():
             )
 
         expected = root / "data" / "signals" / "rank_top5.parquet"
-        print(f"[WARN] rank_top5.parquet not found. Auto-building -> {expected}")
-        rank_found = build_rank_top5_from_local(
-            bars_dir=bars_dir,
+        print(f"[WARN] rank_top5.parquet not found. Auto-building from SQLite -> {expected}")
+        rank_found = build_rank_top5_from_db(
+            db_path=db_path,
+            freq=freq,
             out_path=expected,
             lookback=int(args.lookback),
             rebalance_every=int(args.rebalance_every),
             topk=int(args.topk),
             min_bars=int(args.min_bars),
+            max_codes_scan=int(args.max_codes_scan),
         )
 
     print(f"[INFO] Using rank file: {rank_found}")
@@ -426,7 +451,8 @@ def main():
     for n in range(1, int(args.topn_max) + 1):
         print(f"Running Top{n} ...")
         eq = run_one(
-            bars_dir=bars_dir,
+            db_path=db_path,
+            freq=freq,
             rank_df=rank_df,
             calendar_code=(args.calendar_code or "").strip() or None,
             topn=n,
@@ -462,5 +488,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # 运行回测
     main()
