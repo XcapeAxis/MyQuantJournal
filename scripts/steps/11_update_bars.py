@@ -77,6 +77,20 @@ def get_conn(db_path: Path) -> sqlite3.Connection:
 
 
 def list_db_codes(db_path: Path, freq: str) -> List[str]:
+    # 优先从symbols.csv读取universe，确保只使用符合条件的股票
+    symbols_path = db_path.parent / "meta" / "symbols.csv"
+    if symbols_path.exists():
+        try:
+            df = pd.read_csv(symbols_path, dtype={"code": str})
+            # 只保留主板且非ST的股票
+            df = df[(df["board"] == "mainboard") & (df["is_st"] == False)]
+            codes = df["code"].tolist()
+            if codes:
+                return sorted(codes)
+        except Exception as e:
+            print(f"[WARN] Failed to read symbols.csv: {e}, falling back to DB query")
+    
+    #  fallback: 从DB查询并过滤
     sql = "SELECT DISTINCT symbol FROM bars WHERE freq=?"
     with get_conn(db_path) as conn:
         rows = conn.execute(sql, (freq,)).fetchall()
@@ -469,14 +483,7 @@ def main():
     if rank_found is None:
         if int(args.auto_build_rank) != 1:
             raise FileNotFoundError(
-                "Missing rank file."
-                f"Tried: {rank_path}"
-                f"Project default: {project_rank}
-"
-                f"Legacy default: {root / 'data' / 'signals' / 'rank_top5.parquet'}
-"
-                "Enable auto build: --auto-build-rank 1
-"
+                f"Missing rank file.\nTried: {rank_path}\nProject default: {project_rank}\nLegacy default: {root / 'data' / 'signals' / 'rank_top5.parquet'}\nEnable auto build: --auto-build-rank 1\n"
             )
 
         print(f"[WARN] rank_top5.parquet not found. Auto-building from SQLite -> {project_rank}")
