@@ -77,30 +77,36 @@ def get_conn(db_path: Path) -> sqlite3.Connection:
 
 
 def list_db_codes(db_path: Path, freq: str) -> List[str]:
+    # 从DB获取实际存在的股票列表
+    sql = "SELECT DISTINCT symbol FROM bars WHERE freq=?"
+    with get_conn(db_path) as conn:
+        rows = conn.execute(sql, (freq,)).fetchall()
+    
+    # 构建DB中实际存在的股票集合
+    db_codes = set()
+    for (sym,) in rows:
+        sym = str(sym).zfill(6)
+        if sym.isdigit() and len(sym) == 6 and is_mainboard(sym):
+            db_codes.add(sym)
+    
     # 优先从symbols.csv读取universe，确保只使用符合条件的股票
     symbols_path = db_path.parent / "meta" / "symbols.csv"
-    if symbols_path.exists():
+    if symbols_path.exists() and db_codes:
         try:
             df = pd.read_csv(symbols_path, dtype={"code": str})
             # 只保留主板且非ST的股票
             df = df[(df["board"] == "mainboard") & (df["is_st"] == False)]
-            codes = df["code"].tolist()
-            if codes:
-                return sorted(codes)
+            symbols_codes = set(df["code"].tolist())
+            
+            # 取交集：只返回DB中实际存在的股票
+            filtered_codes = sorted(symbols_codes.intersection(db_codes))
+            if filtered_codes:
+                return filtered_codes
         except Exception as e:
             print(f"[WARN] Failed to read symbols.csv: {e}, falling back to DB query")
     
-    #  fallback: 从DB查询并过滤
-    sql = "SELECT DISTINCT symbol FROM bars WHERE freq=?"
-    with get_conn(db_path) as conn:
-        rows = conn.execute(sql, (freq,)).fetchall()
-
-    codes = []
-    for (sym,) in rows:
-        sym = str(sym).zfill(6)
-        if sym.isdigit() and len(sym) == 6 and is_mainboard(sym):
-            codes.append(sym)
-    return sorted(set(codes))
+    #  fallback: 返回DB中实际存在的股票
+    return sorted(db_codes)
 
 
 def load_code_df(
