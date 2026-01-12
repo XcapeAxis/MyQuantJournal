@@ -2,6 +2,7 @@
 numpy
 pandas
 matplotlib
+tqdm
 
 # data
 akshare
