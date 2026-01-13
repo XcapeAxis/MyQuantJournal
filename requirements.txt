@@ -2,6 +2,10 @@
 numpy
 pandas
 matplotlib
+<<<<<<< HEAD
+tqdm
+=======
+>>>>>>> main
 
 # data
 akshare

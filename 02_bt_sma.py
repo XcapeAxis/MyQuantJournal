@@ -39,7 +39,31 @@ class ChinaStockComm(bt.CommInfoBase):
         return comm
 
 if __name__ == "__main__":
-    df = pd.read_parquet(DATA_PATH)
+    # 验证数据文件存在
+    if not os.path.exists(DATA_PATH):
+        print(f"Error: Data file not found: {DATA_PATH}")
+        exit(1)
+    
+    try:
+        df = pd.read_parquet(DATA_PATH)
+        if df.empty:
+            print("Error: Data file is empty")
+            exit(1)
+        
+        # 验证必要列存在
+        required_cols = ["open", "high", "low", "close", "volume"]
+        missing_cols = [c for c in required_cols if c not in df.columns]
+        if missing_cols:
+            print(f"Error: Missing required columns: {missing_cols}")
+            exit(1)
+        
+        # 验证数据有效性
+        if df["close"].isna().all():
+            print("Error: All close prices are NaN")
+            exit(1)
+    except Exception as e:
+        print(f"Error reading data file: {e}")
+        exit(1)
 
     data = bt.feeds.PandasData(dataname=df)
 

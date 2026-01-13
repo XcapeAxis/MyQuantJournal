@@ -38,6 +38,62 @@ def is_st(name: str) -> bool:
     return "ST" in name or "退" in name
 
 
+<<<<<<< HEAD
+def safe_parse_boolean(value) -> bool:
+    """安全解析布尔值，支持多种格式：
+    - 布尔值：True/False
+    - 字符串："true"/"false"/"TRUE"/"FALSE"/"1"/"0"
+    - 数字：1/0
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        value = value.strip().lower()
+        if value in ("true", "t", "1", "yes", "y"):
+            return True
+        if value in ("false", "f", "0", "no", "n"):
+            return False
+    return False
+
+
+def filter_universe(symbols_df: pd.DataFrame) -> pd.DataFrame:
+    """Universe过滤函数（可复用）
+    过滤规则：
+    1. board == "mainboard"
+    2. is_st == False
+    3. 排除300/301/688/689/8xx/4xx前缀（以防symbols.csv出错）
+    
+    参数：
+        symbols_df: 包含code, is_st, board列的DataFrame
+    返回：
+        过滤后的DataFrame
+    """
+    df = symbols_df.copy()
+    
+    # 安全解析is_st列
+    df["is_st"] = df["is_st"].apply(safe_parse_boolean)
+    
+    # 1. 基本过滤：主板且非ST
+    df = df[(df["board"] == "mainboard") & (df["is_st"] == False)]
+    
+    # 2. 额外保险：排除特定前缀
+    def is_valid_code(code):
+        code = str(code).zfill(6)
+        invalid_prefixes = ["300", "301", "688", "689", "8", "4"]
+        return not any(code.startswith(prefix) for prefix in invalid_prefixes)
+    
+    df = df[df["code"].apply(is_valid_code)]
+    
+    # 去重并排序
+    df = df.drop_duplicates("code").sort_values("code").reset_index(drop=True)
+    
+    return df
+
+
+=======
+>>>>>>> main
 def build_symbols_csv() -> Path:
     # 兼容不同版本 AKShare 列名
     df = ak.stock_info_a_code_name()
@@ -69,6 +125,39 @@ def build_symbols_csv() -> Path:
     # 添加ST标记
     df["is_st"] = df["name"].apply(is_st)
     
+<<<<<<< HEAD
+    # 使用统一过滤函数
+    df = filter_universe(df)
+    
+    # 保存完整symbols.csv（处理可能的权限问题）
+    out_path = OUT_DIR / "symbols.csv"
+    try:
+        df[["code", "name", "is_st", "board"]].to_csv(
+            out_path, index=False, encoding="utf-8-sig"
+        )
+        print(f"Saved symbols: {out_path} rows={len(df)}")
+    except Exception as e:
+        print(f"Warning: Failed to save symbols.csv: {e}")
+        print("Continuing to generate frozen universe...")
+    
+    # 生成冻结的universe列表（用于2026Q1_mom项目）
+    project_meta_dir = Path("data/projects/2026Q1_mom/meta")
+    project_meta_dir.mkdir(parents=True, exist_ok=True)
+    
+    universe_path = project_meta_dir / "universe_codes.txt"
+    try:
+        with open(universe_path, "w") as f:
+            for code in df["code"]:
+                f.write(f"{code}\n")
+        
+        print(f"Saved frozen universe: {universe_path} rows={len(df)}")
+        print(f"Universe size: {len(df)}")
+        print(f"Sample codes: {', '.join(df['code'].head(10).tolist())}")
+    except Exception as e:
+        print(f"Error: Failed to save frozen universe: {e}")
+        raise
+    
+=======
     # 过滤规则：
     # 1. 仅保留主板
     # 2. 剔除ST股票
@@ -82,6 +171,7 @@ def build_symbols_csv() -> Path:
         out_path, index=False, encoding="utf-8-sig"
     )
     print(f"Saved symbols: {out_path} rows={len(df)}")
+>>>>>>> main
     return out_path
 
 
