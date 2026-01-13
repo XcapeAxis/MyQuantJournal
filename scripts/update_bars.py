@@ -1,39 +1,47 @@
 from __future__ import annotations
-<<<<<<< HEAD
+
 import argparse
-=======
->>>>>>> main
 import json
 from pathlib import Path
 
-def main():
+
+def load_config(config_path: Path) -> dict:
+    try:
+        return json.loads(config_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            f"Config file not found: {config_path}. Provide --config to set a valid path."
+        )
+
+
+def main() -> None:
     # Placeholder CLI entrypoint.
     # Implement: incremental download/update bars, save to data/raw or data/processed.
-<<<<<<< HEAD
-    
-    # 添加命令行参数支持
     parser = argparse.ArgumentParser(description="Incremental download/update bars")
-    parser.add_argument("--config", type=str, help="Path to config file")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("configs/default.json"),
+        help="Path to config file",
+    )
     args = parser.parse_args()
-    
-    # 配置文件路径处理
-    config_path = Path(args.config) if args.config else Path("configs/default.json")
-    
+
     try:
-        cfg = json.loads(config_path.read_text(encoding="utf-8"))
-        print("[update_bars] config loaded:", cfg["bar_freq"], cfg["start_date"], cfg["end_date"])
-    except FileNotFoundError:
-        print(f"[ERROR] Config file not found: {config_path}")
-        print("Please provide a valid config file path using --config parameter")
-        print("For example: python scripts/update_bars.py --config configs/projects/2026Q1_mom.json")
+        cfg = load_config(args.config)
+    except FileNotFoundError as exc:
+        print(f"[ERROR] {exc}")
         return
-    except KeyError as e:
-        print(f"[ERROR] Missing required config field: {e}")
-        return
-=======
-    cfg = json.loads(Path("configs/default.json").read_text(encoding="utf-8"))
-    print("[update_bars] config loaded:", cfg["bar_freq"], cfg["start_date"], cfg["end_date"])
->>>>>>> main
+
+    try:
+        print(
+            "[update_bars] config loaded:",
+            cfg["bar_freq"],
+            cfg["start_date"],
+            cfg["end_date"],
+        )
+    except KeyError as exc:
+        print(f"[ERROR] Missing required config field: {exc}")
+
 
 if __name__ == "__main__":
     main()
