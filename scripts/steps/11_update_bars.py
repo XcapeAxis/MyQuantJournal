@@ -1170,41 +1170,13 @@ def run_one(
     filtered_rank_df = rank_df[rank_df["code"].isin(valid_codes)].copy()
     
     # 检查rank_df中的日期范围是否与数据库中的实际数据日期范围重叠
-    rank_start = filtered_rank_df["date"].min()
-    rank_end = filtered_rank_df["date"].max()
-    
-    # 直接重新生成rank_df，确保使用最新的数据
-    if debug:
-        print(f"[DEBUG] Regenerating rank_df for date range ({start} to {end})...")
-    # 生成一个临时的rank文件
-    temp_rank_path = Path(f"temp_rank_{topn}.parquet")
-    build_rank_topk_from_db(
-        db_path=db_path,
-        freq=freq,
-        out_path=temp_rank_path,
-        lookback=5,  # 使用更短的lookback，以便在有限数据上生成rank
-        rebalance_every=3,  # 使用更短的rebalance周期
-        topk=topn,
-        min_bars=5,  # 降低最小bar数要求，以便在有限数据上生成rank
-        max_codes_scan=10,
-        debug=debug
-    )
-    # 读取临时rank文件
-    filtered_rank_df = pd.read_parquet(temp_rank_path)
-    filtered_rank_df["date"] = pd.to_datetime(filtered_rank_df["date"])
-    filtered_rank_df["code"] = filtered_rank_df["code"].astype(str).str.zfill(6)
-    # 删除临时文件
-    temp_rank_path.unlink()
-    
-    # 调试：打印重新生成的rank_df的日期范围
-    if debug:
-        print(f"[DEBUG] Regenerated rank_df date range: {filtered_rank_df['date'].min()} to {filtered_rank_df['date'].max()}")
-        print(f"[DEBUG] Regenerated rank_df shape: {filtered_rank_df.shape}")
-        print(f"[DEBUG] Regenerated rank_df codes: {sorted(filtered_rank_df['code'].unique().tolist())}")
+    if not filtered_rank_df.empty:
+        rank_start = filtered_rank_df["date"].min()
+        rank_end = filtered_rank_df["date"].max()
     
     # 调试：打印过滤后的rank_df的日期范围
     if debug:
-        print(f"[DEBUG] Final filtered rank_df date range: {filtered_rank_df['date'].min()} to {filtered_rank_df['date'].max()}")
+        print(f"[DEBUG] Filtered rank_df date range: {filtered_rank_df['date'].min() if not filtered_rank_df.empty else 'N/A'} to {filtered_rank_df['date'].max() if not filtered_rank_df.empty else 'N/A'}")
     
     # 调试：打印过滤后的rank_df信息
     if debug:
@@ -1402,7 +1374,7 @@ def main():
     ap.add_argument("--max-codes-scan", type=int, default=4000)
 
     # Bars update mode
-    ap.add_argument("--mode", type=str, default="incremental", choices=["incremental", "backfill"], help="Bars update mode: incremental or backfill")
+    ap.add_argument("--mode", type=str, default="run", choices=["run", "incremental", "backfill"], help="Script mode: run (default, backtest), incremental (update bars), or backfill (full bars backfill)")
     ap.add_argument("--start-date", type=str, default="20160101", help="Start date for backfill mode (format: YYYYMMDD)")
     ap.add_argument("--end-date", type=str, default=None, help="End date for backfill mode (format: YYYYMMDD), default: today")
     ap.add_argument("--workers", type=int, default=4, help="Number of worker threads for parallel download (default: 4, range: 1-10)")
