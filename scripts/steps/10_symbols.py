@@ -38,6 +38,7 @@ def is_st(name: str) -> bool:
     return "ST" in name or "退" in name
 
 
+<<<<<<< HEAD
 def safe_parse_boolean(value) -> bool:
     """安全解析布尔值，支持多种格式：
     - 布尔值：True/False
@@ -91,6 +92,8 @@ def filter_universe(symbols_df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+=======
+>>>>>>> main
 def build_symbols_csv() -> Path:
     # 兼容不同版本 AKShare 列名
     df = ak.stock_info_a_code_name()
@@ -122,6 +125,7 @@ def build_symbols_csv() -> Path:
     # 添加ST标记
     df["is_st"] = df["name"].apply(is_st)
     
+<<<<<<< HEAD
     # 使用统一过滤函数
     df = filter_universe(df)
     
@@ -153,6 +157,21 @@ def build_symbols_csv() -> Path:
         print(f"Error: Failed to save frozen universe: {e}")
         raise
     
+=======
+    # 过滤规则：
+    # 1. 仅保留主板
+    # 2. 剔除ST股票
+    df = df[(df["board"] == "mainboard") & (df["is_st"] == False)]
+    
+    # 去重并排序
+    df = df.drop_duplicates("code").sort_values("code").reset_index(drop=True)
+
+    out_path = OUT_DIR / "symbols.csv"
+    df[["code", "name", "is_st", "board"]].to_csv(
+        out_path, index=False, encoding="utf-8-sig"
+    )
+    print(f"Saved symbols: {out_path} rows={len(df)}")
+>>>>>>> main
     return out_path
 
 

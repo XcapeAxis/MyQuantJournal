@@ -1,11 +1,15 @@
 from __future__ import annotations
+<<<<<<< HEAD
 import argparse
+=======
+>>>>>>> main
 import json
 from pathlib import Path
 
 def main():
     # Placeholder CLI entrypoint.
     # Implement: incremental download/update bars, save to data/raw or data/processed.
+<<<<<<< HEAD
     
     # 添加命令行参数支持
     parser = argparse.ArgumentParser(description="Incremental download/update bars")
@@ -26,6 +30,10 @@ def main():
     except KeyError as e:
         print(f"[ERROR] Missing required config field: {e}")
         return
+=======
+    cfg = json.loads(Path("configs/default.json").read_text(encoding="utf-8"))
+    print("[update_bars] config loaded:", cfg["bar_freq"], cfg["start_date"], cfg["end_date"])
+>>>>>>> main
 
 if __name__ == "__main__":
     main()
