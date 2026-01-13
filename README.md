@@ -21,6 +21,11 @@ A minimal, reproducible pipeline for:
 ## Project Structure
 - `src/quant_mvp/` core library
 - `scripts/` CLI entrypoints
+  - `scripts/steps/` pipeline steps
+  - `scripts/examples/` standalone demos
+  - `scripts/tools/` audits and utilities
+  - `scripts/benchmarks/` performance checks
+  - `scripts/legacy/` historical scripts kept for reference
 - `configs/` experiment configs (tracked)
 - `data/` local datasets (NOT tracked except placeholders)
 - `artifacts/` outputs (NOT tracked)
